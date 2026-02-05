@@ -153,13 +153,13 @@ export default function App() {
           timestamp: Date.now()
         }]);
       }
-    } catch (err) {
-      console.error(err);
+    } catch (err: any) {
+      console.error('Upload error:', err);
       setIsProcessing(false);
       setMessages(prev => [...prev, {
         id: uuidv4(),
         role: 'system',
-        content: `Error processing files. Please try again.`,
+        content: `❌ Error: ${err?.message || 'Failed to process files'}`,
         timestamp: Date.now()
       }]);
     }

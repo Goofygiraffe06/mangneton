@@ -1,7 +1,7 @@
 import * as pdfjsLib from 'pdfjs-dist';
 
-// Initialize PDF.js worker
-pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
+// Use unpkg CDN which has all versions
+pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
 
 export interface ParsedDocument {
   text: string;
@@ -10,150 +10,94 @@ export interface ParsedDocument {
 
 export const parseFile = async (file: File): Promise<ParsedDocument> => {
   const fileType = file.type;
+  const fileName = file.name.toLowerCase();
+
+  console.log(`[Parser] File: ${file.name}, Type: ${fileType}`);
 
   try {
-    if (fileType === 'application/pdf') {
+    if (fileType === 'application/pdf' || fileName.endsWith('.pdf')) {
       return await parsePDF(file);
-    } else if (fileType === 'text/plain' || fileType.includes('text')) {
-      return await parseText(file);
     } else {
-      // Fallback - try as text
-      console.warn(`Unknown file type: ${fileType}, attempting text parsing`);
       return await parseText(file);
     }
   } catch (error) {
-    console.error('Error parsing file:', error);
-    throw new Error(`Failed to parse file: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    console.error('[Parser] Error:', error);
+    throw error;
   }
 };
 
 const parsePDF = async (file: File): Promise<ParsedDocument> => {
-  try {
-    const arrayBuffer = await file.arrayBuffer();
-    const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
-    const pdf = await loadingTask.promise;
-    const numPages = pdf.numPages;
+  console.log('[PDF] Starting...');
 
-    console.log(`PDF loaded: ${numPages} pages`);
+  const arrayBuffer = await file.arrayBuffer();
+  console.log(`[PDF] Buffer: ${arrayBuffer.byteLength} bytes`);
 
-    const chunks: { text: string; page: number }[] = [];
-    let fullText = '';
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  console.log(`[PDF] Loaded: ${pdf.numPages} pages`);
 
-    for (let pageNum = 1; pageNum <= numPages; pageNum++) {
-      const page = await pdf.getPage(pageNum);
-      const textContent = await page.getTextContent();
+  const chunks: { text: string; page: number }[] = [];
+  let fullText = '';
 
-      // Better text extraction with proper spacing and line breaks
-      let pageText = '';
-      let lastY = -1;
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const content = await page.getTextContent();
 
-      for (const item of textContent.items) {
-        const textItem = item as any;
+    const text = content.items
+      .map((item: any) => item.str || '')
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim();
 
-        // Check if we need a line break (new line detected)
-        if (lastY !== -1 && Math.abs(textItem.transform[5] - lastY) > 5) {
-          pageText += '\n';
-        }
-
-        // Add space if needed (check horizontal spacing)
-        if (pageText.length > 0 && !pageText.endsWith(' ') && !pageText.endsWith('\n')) {
-          pageText += ' ';
-        }
-
-        pageText += textItem.str;
-        lastY = textItem.transform[5];
-      }
-
-      // Clean up the text
-      pageText = pageText
-        .replace(/\s+/g, ' ')  // Normalize whitespace
-        .replace(/\n\s+/g, '\n')  // Clean line breaks
-        .trim();
-
-      if (pageText.length > 0) {
-        chunks.push({ text: pageText, page: pageNum });
-        fullText += pageText + '\n\n';
-        console.log(`Page ${pageNum}: ${pageText.length} characters extracted`);
-      } else {
-        console.warn(`Page ${pageNum}: No text extracted (might be image-based)`);
-      }
+    if (text.length > 0) {
+      chunks.push({ text, page: i });
+      fullText += text + '\n\n';
+      console.log(`[PDF] Page ${i}: ${text.length} chars`);
     }
-
-    if (fullText.trim().length === 0) {
-      throw new Error('No text could be extracted from PDF. It might be a scanned document or image-based PDF.');
-    }
-
-    console.log(`Total text extracted: ${fullText.length} characters from ${chunks.length} pages`);
-    return { text: fullText, chunks };
-
-  } catch (error) {
-    console.error('PDF parsing error:', error);
-    throw new Error(`PDF parsing failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
   }
+
+  if (fullText.trim().length === 0) {
+    throw new Error('No text in PDF - may be scanned/image-based');
+  }
+
+  console.log(`[PDF] Done: ${fullText.length} total chars`);
+  return { text: fullText.trim(), chunks };
 };
 
 const parseText = async (file: File): Promise<ParsedDocument> => {
-  try {
-    const text = await file.text();
+  const text = await file.text();
 
-    if (!text || text.trim().length === 0) {
-      throw new Error('File is empty or contains no readable text');
-    }
-
-    console.log(`Text file loaded: ${text.length} characters`);
-
-    return {
-      text,
-      chunks: [{ text, page: 1 }]
-    };
-  } catch (error) {
-    console.error('Text parsing error:', error);
-    throw new Error(`Text parsing failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+  if (!text || text.trim().length === 0) {
+    throw new Error('File is empty');
   }
+
+  console.log(`[Text] Done: ${text.length} chars`);
+  return {
+    text: text.trim(),
+    chunks: [{ text: text.trim(), page: 1 }]
+  };
 };
 
-export const createChunks = (text: string, page: number, chunkSize = 800, overlap = 100) => {
-  if (!text || text.trim().length === 0) {
-    console.warn(`Empty text for page ${page}, skipping chunking`);
-    return [];
-  }
+export const createChunks = (text: string, page: number, chunkSize = 500, overlap = 50) => {
+  if (!text || text.trim().length === 0) return [];
 
-  // Split by words, preserving some structure
-  const words = text.split(/\s+/).filter(word => word.length > 0);
-  const chunks = [];
+  const words = text.split(/\s+/).filter(w => w.length > 0);
+  if (words.length === 0) return [];
 
-  if (words.length === 0) {
-    return [];
-  }
-
-  // If text is shorter than chunk size, return as single chunk
   if (words.length <= chunkSize) {
-    return [{
-      text: words.join(' '),
-      metadata: { page, chunkIndex: 0, totalChunks: 1 }
-    }];
+    return [{ text: words.join(' '), metadata: { page } }];
   }
 
-  // Create overlapping chunks
-  let chunkIndex = 0;
+  const chunks = [];
   for (let i = 0; i < words.length; i += (chunkSize - overlap)) {
-    const chunkWords = words.slice(i, i + chunkSize);
-    const chunkText = chunkWords.join(' ');
-
-    if (chunkText.trim().length > 0) {
+    const chunk = words.slice(i, i + chunkSize).join(' ');
+    if (chunk.length > 0) {
       chunks.push({
-        text: chunkText,
-        metadata: {
-          page,
-          chunkIndex,
-          startWord: i,
-          endWord: i + chunkWords.length
-        }
+        text: chunk,
+        metadata: { page, chunkIndex: chunks.length } // Add chunkIndex for context
       });
-      chunkIndex++;
     }
   }
 
-  console.log(`Created ${chunks.length} chunks from page ${page} (${words.length} words)`);
+  console.log(`[Chunks] Page ${page}: ${chunks.length} chunks`);
   return chunks;
 };
