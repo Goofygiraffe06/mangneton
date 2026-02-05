@@ -1,0 +1,5 @@
+{
+  "name": "MANGETON",
+  "description": "A privacy-first, browser-based RAG system for sensitive document intelligence. Runs entirely client-side using Transformers.js and IndexedDB.",
+  "requestFramePermissions": []
+}
