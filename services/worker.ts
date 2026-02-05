@@ -56,7 +56,7 @@ const getGenerator = async (progressCallback?: (data: any) => void) => {
       device: hasWebGPU ? 'webgpu' : 'wasm',
       quantized: true,
       progress_callback: (data: any) => progressCallback?.({ ...data, task: 'generator' })
-    });
+    } as any);
   }
   return generator;
 };
