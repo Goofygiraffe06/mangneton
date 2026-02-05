@@ -292,14 +292,19 @@ self.addEventListener('message', async (e: MessageEvent) => {
       // 4. Build context for LLM
       let context = labeledSources.map((c: any) => {
         const pageInfo = c.metadata?.page ? `[Page ${c.metadata.page}]` : '';
-        return `[${c.sourceId}] ${pageInfo}\n${c.text}`;
-      }).join('\n\n---\n\n');
+        return `${c.text}`;
+      }).join('\n\n');
 
       if (context.length > 3000) context = context.substring(0, 3000);
 
       // 5. Generate answer
       const prompt = `<|im_start|>system
-You are a helpful assistant. Answer the question based on the context provided. Be concise and direct. If the answer is in the context, provide it. Cite sources using [S1], [S2] etc.
+You are a helpful assistant that answers questions based ONLY on the provided context. Rules:
+- Answer in English ONLY
+- Use ONLY information from the context
+- If the answer is not in the context, say "I don't have that information"
+- Do NOT make up or infer information
+- Be direct and concise
 <|im_end|>
 <|im_start|>user
 Context:
