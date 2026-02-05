@@ -71,6 +71,171 @@ const cosineSimilarity = (a: number[], b: number[]) => {
   return dot / (Math.sqrt(normA) * Math.sqrt(normB));
 };
 
+// ========== BM25 Implementation ==========
+const BM25_K1 = 1.5;
+const BM25_B = 0.75;
+
+const tokenize = (text: string): string[] => {
+  return text.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(t => t.length > 2);
+};
+
+const computeIDF = (term: string, docs: string[][]): number => {
+  const docsWithTerm = docs.filter(d => d.includes(term)).length;
+  if (docsWithTerm === 0) return 0;
+  return Math.log((docs.length - docsWithTerm + 0.5) / (docsWithTerm + 0.5) + 1);
+};
+
+const bm25Score = (
+  queryTokens: string[],
+  docTokens: string[],
+  avgDocLen: number,
+  idfMap: Map<string, number>
+): number => {
+  const docLen = docTokens.length;
+  const termFreq = new Map<string, number>();
+  docTokens.forEach(t => termFreq.set(t, (termFreq.get(t) || 0) + 1));
+
+  let score = 0;
+  for (const term of queryTokens) {
+    const tf = termFreq.get(term) || 0;
+    const idf = idfMap.get(term) || 0;
+    const numerator = tf * (BM25_K1 + 1);
+    const denominator = tf + BM25_K1 * (1 - BM25_B + BM25_B * (docLen / avgDocLen));
+    score += idf * (numerator / denominator);
+  }
+  return score;
+};
+
+// ========== Reciprocal Rank Fusion ==========
+const RRF_K = 60; // Standard RRF constant
+
+const reciprocalRankFusion = (rankings: { id: string; rank: number }[][]): Map<string, number> => {
+  const scores = new Map<string, number>();
+  for (const ranking of rankings) {
+    for (const { id, rank } of ranking) {
+      const rrfScore = 1 / (RRF_K + rank);
+      scores.set(id, (scores.get(id) || 0) + rrfScore);
+    }
+  }
+  return scores;
+};
+
+// ========== MMR (Maximal Marginal Relevance) ==========
+const MMR_LAMBDA = 0.7; // Balance relevance vs diversity
+
+const mmrRerank = (
+  candidates: any[],
+  queryVector: number[],
+  k: number
+): any[] => {
+  if (candidates.length <= k) return candidates;
+
+  const selected: any[] = [];
+  const remaining = [...candidates];
+
+  // Always pick the most relevant first
+  selected.push(remaining.shift()!);
+
+  while (selected.length < k && remaining.length > 0) {
+    let bestIdx = 0;
+    let bestScore = -Infinity;
+
+    for (let i = 0; i < remaining.length; i++) {
+      const candidate = remaining[i];
+      const relevance = candidate.combinedScore || 0;
+
+      // Max similarity to already selected docs
+      let maxSim = 0;
+      for (const sel of selected) {
+        const sim = cosineSimilarity(candidate.embedding, sel.embedding);
+        if (sim > maxSim) maxSim = sim;
+      }
+
+      // MMR score: balance relevance and diversity
+      const mmrScore = MMR_LAMBDA * relevance - (1 - MMR_LAMBDA) * maxSim;
+      if (mmrScore > bestScore) {
+        bestScore = mmrScore;
+        bestIdx = i;
+      }
+    }
+
+    selected.push(remaining.splice(bestIdx, 1)[0]);
+  }
+
+  return selected;
+};
+
+// ========== TF-IDF Sentence Scoring ==========
+const tfidfSentenceScore = (
+  sentence: string,
+  queryTokens: Set<string>,
+  allSentences: string[]
+): number => {
+  const sentTokens = tokenize(sentence);
+  if (sentTokens.length === 0) return 0;
+
+  let score = 0;
+  for (const qt of queryTokens) {
+    if (!sentTokens.includes(qt)) continue;
+    // TF in sentence
+    const tf = sentTokens.filter(t => t === qt).length / sentTokens.length;
+    // IDF across all sentences
+    const docsWithTerm = allSentences.filter(s => tokenize(s).includes(qt)).length;
+    const idf = Math.log((allSentences.length + 1) / (docsWithTerm + 1)) + 1;
+    score += tf * idf;
+  }
+  // Normalize by query size
+  return score / Math.sqrt(queryTokens.size);
+};
+
+// ========== Query Expansion for Implicit Intents ==========
+const QUERY_EXPANSIONS: Record<string, string> = {
+  // Identity queries
+  'name': 'name full name person author candidate resume cv profile',
+  'who': 'name person author candidate identity profile about',
+  'contact': 'email phone address contact information linkedin github',
+  'email': 'email mail contact address gmail',
+  'phone': 'phone telephone mobile number contact',
+  
+  // Professional queries
+  'experience': 'experience work job position role employment history professional',
+  'education': 'education degree university college school academic qualification',
+  'skills': 'skills technologies programming languages frameworks tools expertise',
+  'projects': 'projects portfolio work built developed created implemented',
+  'summary': 'summary objective profile about introduction overview',
+  
+  // Common short queries
+  'location': 'location address city country based remote',
+  'company': 'company employer organization worked employment',
+  'title': 'title position role job designation',
+  'languages': 'languages programming technologies stack frameworks',
+};
+
+const IDENTITY_PATTERNS = /^(name|who|what.*name|whose|author|person|candidate)$/i;
+const FIRST_CHUNK_BOOST = 0.15; // Boost for first chunks on identity queries
+
+const expandQuery = (query: string): string => {
+  const normalized = query.toLowerCase().trim();
+  
+  // Direct match
+  if (QUERY_EXPANSIONS[normalized]) {
+    return `${query} ${QUERY_EXPANSIONS[normalized]}`;
+  }
+  
+  // Partial match for compound queries
+  for (const [key, expansion] of Object.entries(QUERY_EXPANSIONS)) {
+    if (normalized.includes(key) && normalized.split(/\s+/).length <= 3) {
+      return `${query} ${expansion}`;
+    }
+  }
+  
+  return query;
+};
+
+const isIdentityQuery = (query: string): boolean => {
+  return IDENTITY_PATTERNS.test(query.trim());
+};
+
 // Cache for vectors to speed up repeated searches
 let chunkCache: any[] | null = null;
 
@@ -115,8 +280,13 @@ self.addEventListener('message', async (e: MessageEvent) => {
       const pipe = await getEmbedder();
       const gen = await getGenerator();
 
-      // 1. Retrieval
-      const output = await pipe(text, { pooling: 'mean', normalize: true });
+      // 1. Query Expansion for implicit intents
+      const expandedQuery = expandQuery(text);
+      const isIdentity = isIdentityQuery(text);
+      console.log(`[Worker] Original: "${text}" | Expanded: "${expandedQuery}" | Identity: ${isIdentity}`);
+
+      // 2. Retrieval with expanded query
+      const output = await pipe(expandedQuery, { pooling: 'mean', normalize: true });
       const queryVector = Array.from(output.data) as number[];
 
       // Use cache if available, otherwise hit DB
@@ -135,69 +305,163 @@ self.addEventListener('message', async (e: MessageEvent) => {
         return;
       }
 
-      const scored = allChunks.map((chunk: any) => ({
-        ...chunk,
-        score: cosineSimilarity(queryVector, chunk.embedding)
-      })).sort((a: any, b: any) => b.score - a.score);
+      const scored = allChunks.map((chunk: any) => {
+        let score = cosineSimilarity(queryVector, chunk.embedding);
+        
+        // Boost first chunks for identity queries (name, contact info usually at top)
+        if (isIdentity && chunk.metadata?.chunkIndex === 0) {
+          score += FIRST_CHUNK_BOOST;
+        }
+        // Also boost page 1, first few chunks for identity
+        if (isIdentity && chunk.metadata?.page === 1 && (chunk.metadata?.chunkIndex ?? 0) < 2) {
+          score += FIRST_CHUNK_BOOST * 0.5;
+        }
+        
+        return { ...chunk, score };
+      }).sort((a: any, b: any) => b.score - a.score);
 
       const topK = scored.slice(0, 8);
 
-      const normalizeText = (s: string) => s.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
-      const queryTokens = new Set(normalizeText(text).split(' ').filter(t => t.length > 2));
+      const queryTokens = new Set(tokenize(text));
+      const queryTokensArr = Array.from(queryTokens);
 
+      // ========== Improved Extractive Answer with TF-IDF ==========
       const buildExtractiveAnswer = (sources: any[]) => {
         const sentenceSplit = (s: string) => s.split(/(?<=[.!?])\s+/).map(x => x.trim()).filter(Boolean);
-        const scoredSentences: { sentence: string; score: number; sourceId: string }[] = [];
+        const allSentences: string[] = [];
+        const sentenceMap: { sentence: string; sourceId: string }[] = [];
+
         sources.forEach((s: any) => {
           const sentences = sentenceSplit(s.text || '');
           sentences.forEach(sentence => {
-            const tokens = new Set(normalizeText(sentence).split(' ').filter(t => t.length > 2));
-            let overlap = 0;
-            queryTokens.forEach(t => {
-              if (tokens.has(t)) overlap += 1;
-            });
-            if (overlap > 0) {
-              const score = queryTokens.size ? overlap / queryTokens.size : 0;
-              scoredSentences.push({ sentence, score, sourceId: s.sourceId });
+            if (sentence.length > 20) { // Filter very short sentences
+              allSentences.push(sentence);
+              sentenceMap.push({ sentence, sourceId: s.sourceId });
             }
           });
         });
+
+        const scoredSentences = sentenceMap.map(({ sentence, sourceId }) => ({
+          sentence,
+          sourceId,
+          score: tfidfSentenceScore(sentence, queryTokens, allSentences)
+        })).filter(s => s.score > 0);
+
         scoredSentences.sort((a, b) => b.score - a.score);
-        const picked = scoredSentences.slice(0, 2);
+
+        // Pick top sentences with diversity (avoid near-duplicates)
+        const picked: typeof scoredSentences = [];
+        for (const s of scoredSentences) {
+          if (picked.length >= 3) break;
+          const isDuplicate = picked.some(p => {
+            const overlap = tokenize(p.sentence).filter(t => tokenize(s.sentence).includes(t)).length;
+            return overlap / Math.min(tokenize(p.sentence).length, tokenize(s.sentence).length) > 0.6;
+          });
+          if (!isDuplicate) picked.push(s);
+        }
+
         if (picked.length === 0) return null;
-        const answer = picked.map(p => `${p.sentence} [${p.sourceId}]`).join(' ');
-        return answer;
+        return picked.map(p => `${p.sentence} [${p.sourceId}]`).join(' ');
       };
 
-      const withLexical = topK.map((chunk: any) => {
-        const chunkText = chunk.text || '';
-        const chunkTokens = new Set(normalizeText(chunkText).split(' ').filter(t => t.length > 2));
-        let overlap = 0;
-        queryTokens.forEach(t => {
-          if (chunkTokens.has(t)) overlap += 1;
-        });
-        const lexicalScore = queryTokens.size ? overlap / queryTokens.size : 0;
-        return { ...chunk, lexicalScore };
+      // ========== BM25 Scoring ==========
+      const allDocTokens = topK.map((c: any) => tokenize(c.text || ''));
+      const avgDocLen = allDocTokens.reduce((sum, d) => sum + d.length, 0) / (allDocTokens.length || 1);
+
+      // Pre-compute IDF for query terms
+      const idfMap = new Map<string, number>();
+      queryTokensArr.forEach(term => {
+        idfMap.set(term, computeIDF(term, allDocTokens));
       });
 
-      // Combine semantic + lexical
-      const combined = withLexical.map((chunk: any) => {
-        const semantic = chunk.score ?? 0;
-        const lexical = chunk.lexicalScore ?? 0;
-        const score = (semantic * 0.7) + (lexical * 0.3);
-        return { ...chunk, combinedScore: score };
-      }).sort((a: any, b: any) => b.combinedScore - a.combinedScore);
+      const withBM25 = topK.map((chunk: any, idx: number) => {
+        const docTokens = allDocTokens[idx];
+        const bm25 = bm25Score(queryTokensArr, docTokens, avgDocLen, idfMap);
+        return { ...chunk, bm25Score: bm25 };
+      });
 
-      const labeledSources = combined.map((chunk: any, idx: number) => ({
+      // ========== Reciprocal Rank Fusion ==========
+      // Rank by semantic score
+      const semanticRanking = [...withBM25]
+        .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
+        .map((c, i) => ({ id: c.id, rank: i + 1 }));
+
+      // Rank by BM25 score
+      const bm25Ranking = [...withBM25]
+        .sort((a, b) => (b.bm25Score ?? 0) - (a.bm25Score ?? 0))
+        .map((c, i) => ({ id: c.id, rank: i + 1 }));
+
+      // Fuse rankings
+      const rrfScores = reciprocalRankFusion([semanticRanking, bm25Ranking]);
+
+      const combined = withBM25.map((chunk: any) => ({
+        ...chunk,
+        combinedScore: rrfScores.get(chunk.id) || 0
+      })).sort((a: any, b: any) => b.combinedScore - a.combinedScore);
+
+      // ========== MMR Reranking for Diversity ==========
+      const diversified = mmrRerank(combined, queryVector, 8);
+
+      const labeledSources = diversified.map((chunk: any, idx: number) => ({
         ...chunk,
         sourceId: `S${idx + 1}`
       }));
 
+      // ========== Special Handler for Identity Queries ==========
+      const extractIdentityInfo = (sources: any[]): string | null => {
+        // For identity queries, look at the beginning of documents
+        const firstChunks = sources.filter((s: any) => 
+          s.metadata?.chunkIndex === 0 || 
+          (s.metadata?.page === 1 && (s.metadata?.chunkIndex ?? 0) < 2)
+        );
+        
+        if (firstChunks.length === 0 && sources.length > 0) {
+          firstChunks.push(sources[0]); // Fallback to first source
+        }
+        
+        for (const chunk of firstChunks) {
+          const text = chunk.text || '';
+          const lines = text.split('\n').map((l: string) => l.trim()).filter(Boolean);
+          
+          // Names are often the first non-empty line in resumes/CVs
+          // They're typically short (1-4 words) and don't contain common resume keywords
+          const skipPatterns = /^(resume|cv|curriculum|summary|objective|experience|education|skills|contact|address|email|phone|profile)/i;
+          
+          for (const line of lines.slice(0, 5)) { // Check first 5 lines
+            const wordCount = line.split(/\s+/).length;
+            // Name heuristic: 1-4 words, no common headers, mostly letters
+            if (wordCount >= 1 && wordCount <= 4 && 
+                !skipPatterns.test(line) && 
+                /^[A-Za-z\s.\-']+$/.test(line) &&
+                line.length >= 3 && line.length <= 50) {
+              return `${line} [${chunk.sourceId}]`;
+            }
+          }
+        }
+        return null;
+      };
+
       // If retrieval confidence is too low, avoid answering
       const topScore = labeledSources[0]?.combinedScore ?? 0;
       const wordCount = text.trim().split(/\s+/).filter(Boolean).length;
-      const minScore = wordCount <= 3 ? 0.08 : 0.18;
+      
+      // Lower threshold for identity queries - we have structural heuristics
+      const minScore = isIdentity ? 0.01 : (wordCount <= 3 ? 0.08 : 0.18);
+      
       if (topScore < minScore) {
+        // Try identity extraction first for identity queries
+        if (isIdentity) {
+          const identityAnswer = extractIdentityInfo(labeledSources);
+          if (identityAnswer) {
+            self.postMessage({ type: 'retrieval_done', payload: { sources: labeledSources } });
+            self.postMessage({
+              type: 'query_result',
+              payload: { answer: identityAnswer, sources: labeledSources }
+            });
+            return;
+          }
+        }
+        
         const extractive = buildExtractiveAnswer(labeledSources);
         if (extractive) {
           self.postMessage({
@@ -218,6 +482,19 @@ self.addEventListener('message', async (e: MessageEvent) => {
           }
         });
         return;
+      }
+      
+      // For identity queries with sufficient score, still try extraction first
+      if (isIdentity) {
+        const identityAnswer = extractIdentityInfo(labeledSources);
+        if (identityAnswer) {
+          self.postMessage({ type: 'retrieval_done', payload: { sources: labeledSources } });
+          self.postMessage({
+            type: 'query_result',
+            payload: { answer: identityAnswer, sources: labeledSources }
+          });
+          return;
+        }
       }
 
       // FAST RESPONSE: Send sources immediately
