@@ -165,77 +165,6 @@ const mmrRerank = (
   return selected;
 };
 
-// ========== TF-IDF Sentence Scoring ==========
-const tfidfSentenceScore = (
-  sentence: string,
-  queryTokens: Set<string>,
-  allSentences: string[]
-): number => {
-  const sentTokens = tokenize(sentence);
-  if (sentTokens.length === 0) return 0;
-
-  let score = 0;
-  for (const qt of queryTokens) {
-    if (!sentTokens.includes(qt)) continue;
-    // TF in sentence
-    const tf = sentTokens.filter(t => t === qt).length / sentTokens.length;
-    // IDF across all sentences
-    const docsWithTerm = allSentences.filter(s => tokenize(s).includes(qt)).length;
-    const idf = Math.log((allSentences.length + 1) / (docsWithTerm + 1)) + 1;
-    score += tf * idf;
-  }
-  // Normalize by query size
-  return score / Math.sqrt(queryTokens.size);
-};
-
-// ========== Query Expansion for Implicit Intents ==========
-const QUERY_EXPANSIONS: Record<string, string> = {
-  // Identity queries
-  'name': 'name full name person author candidate resume cv profile',
-  'who': 'name person author candidate identity profile about',
-  'contact': 'email phone address contact information linkedin github',
-  'email': 'email mail contact address gmail',
-  'phone': 'phone telephone mobile number contact',
-  
-  // Professional queries
-  'experience': 'experience work job position role employment history professional',
-  'education': 'education degree university college school academic qualification',
-  'skills': 'skills technologies programming languages frameworks tools expertise',
-  'projects': 'projects portfolio work built developed created implemented',
-  'summary': 'summary objective profile about introduction overview',
-  
-  // Common short queries
-  'location': 'location address city country based remote',
-  'company': 'company employer organization worked employment',
-  'title': 'title position role job designation',
-  'languages': 'languages programming technologies stack frameworks',
-};
-
-const IDENTITY_PATTERNS = /^(name|who|what.*name|whose|author|person|candidate)$/i;
-const FIRST_CHUNK_BOOST = 0.15; // Boost for first chunks on identity queries
-
-const expandQuery = (query: string): string => {
-  const normalized = query.toLowerCase().trim();
-  
-  // Direct match
-  if (QUERY_EXPANSIONS[normalized]) {
-    return `${query} ${QUERY_EXPANSIONS[normalized]}`;
-  }
-  
-  // Partial match for compound queries
-  for (const [key, expansion] of Object.entries(QUERY_EXPANSIONS)) {
-    if (normalized.includes(key) && normalized.split(/\s+/).length <= 3) {
-      return `${query} ${expansion}`;
-    }
-  }
-  
-  return query;
-};
-
-const isIdentityQuery = (query: string): boolean => {
-  return IDENTITY_PATTERNS.test(query.trim());
-};
-
 // Cache for vectors to speed up repeated searches
 let chunkCache: any[] | null = null;
 
@@ -280,16 +209,11 @@ self.addEventListener('message', async (e: MessageEvent) => {
       const pipe = await getEmbedder();
       const gen = await getGenerator();
 
-      // 1. Query Expansion for implicit intents
-      const expandedQuery = expandQuery(text);
-      const isIdentity = isIdentityQuery(text);
-      console.log(`[Worker] Original: "${text}" | Expanded: "${expandedQuery}" | Identity: ${isIdentity}`);
-
-      // 2. Retrieval with expanded query
-      const output = await pipe(expandedQuery, { pooling: 'mean', normalize: true });
+      // 1. Embed the query
+      const output = await pipe(text, { pooling: 'mean', normalize: true });
       const queryVector = Array.from(output.data) as number[];
 
-      // Use cache if available, otherwise hit DB
+      // 2. Retrieve from cache/DB
       if (!chunkCache) {
         const db = await initDB();
         chunkCache = await db.getAll(STORE_CHUNKS);
@@ -300,69 +224,21 @@ self.addEventListener('message', async (e: MessageEvent) => {
       if (allChunks.length === 0) {
         self.postMessage({
           type: 'query_result',
-          payload: { answer: 'No documents found.', sources: [] }
+          payload: { answer: 'No documents loaded. Please upload a document first.', sources: [] }
         });
         return;
       }
 
-      const scored = allChunks.map((chunk: any) => {
-        let score = cosineSimilarity(queryVector, chunk.embedding);
-        
-        // Boost first chunks for identity queries (name, contact info usually at top)
-        if (isIdentity && chunk.metadata?.chunkIndex === 0) {
-          score += FIRST_CHUNK_BOOST;
-        }
-        // Also boost page 1, first few chunks for identity
-        if (isIdentity && chunk.metadata?.page === 1 && (chunk.metadata?.chunkIndex ?? 0) < 2) {
-          score += FIRST_CHUNK_BOOST * 0.5;
-        }
-        
-        return { ...chunk, score };
-      }).sort((a: any, b: any) => b.score - a.score);
+      // 3. Score by cosine similarity
+      const scored = allChunks.map((chunk: any) => ({
+        ...chunk,
+        score: cosineSimilarity(queryVector, chunk.embedding)
+      })).sort((a: any, b: any) => b.score - a.score);
 
       const topK = scored.slice(0, 8);
 
       const queryTokens = new Set(tokenize(text));
       const queryTokensArr = Array.from(queryTokens);
-
-      // ========== Improved Extractive Answer with TF-IDF ==========
-      const buildExtractiveAnswer = (sources: any[]) => {
-        const sentenceSplit = (s: string) => s.split(/(?<=[.!?])\s+/).map(x => x.trim()).filter(Boolean);
-        const allSentences: string[] = [];
-        const sentenceMap: { sentence: string; sourceId: string }[] = [];
-
-        sources.forEach((s: any) => {
-          const sentences = sentenceSplit(s.text || '');
-          sentences.forEach(sentence => {
-            if (sentence.length > 20) { // Filter very short sentences
-              allSentences.push(sentence);
-              sentenceMap.push({ sentence, sourceId: s.sourceId });
-            }
-          });
-        });
-
-        const scoredSentences = sentenceMap.map(({ sentence, sourceId }) => ({
-          sentence,
-          sourceId,
-          score: tfidfSentenceScore(sentence, queryTokens, allSentences)
-        })).filter(s => s.score > 0);
-
-        scoredSentences.sort((a, b) => b.score - a.score);
-
-        // Pick top sentences with diversity (avoid near-duplicates)
-        const picked: typeof scoredSentences = [];
-        for (const s of scoredSentences) {
-          if (picked.length >= 3) break;
-          const isDuplicate = picked.some(p => {
-            const overlap = tokenize(p.sentence).filter(t => tokenize(s.sentence).includes(t)).length;
-            return overlap / Math.min(tokenize(p.sentence).length, tokenize(s.sentence).length) > 0.6;
-          });
-          if (!isDuplicate) picked.push(s);
-        }
-
-        if (picked.length === 0) return null;
-        return picked.map(p => `${p.sentence} [${p.sourceId}]`).join(' ');
-      };
 
       // ========== BM25 Scoring ==========
       const allDocTokens = topK.map((c: any) => tokenize(c.text || ''));
@@ -407,127 +283,35 @@ self.addEventListener('message', async (e: MessageEvent) => {
         sourceId: `S${idx + 1}`
       }));
 
-      // ========== Special Handler for Identity Queries ==========
-      const extractIdentityInfo = (sources: any[]): string | null => {
-        // For identity queries, look at the beginning of documents
-        const firstChunks = sources.filter((s: any) => 
-          s.metadata?.chunkIndex === 0 || 
-          (s.metadata?.page === 1 && (s.metadata?.chunkIndex ?? 0) < 2)
-        );
-        
-        if (firstChunks.length === 0 && sources.length > 0) {
-          firstChunks.push(sources[0]); // Fallback to first source
-        }
-        
-        for (const chunk of firstChunks) {
-          const text = chunk.text || '';
-          const lines = text.split('\n').map((l: string) => l.trim()).filter(Boolean);
-          
-          // Names are often the first non-empty line in resumes/CVs
-          // They're typically short (1-4 words) and don't contain common resume keywords
-          const skipPatterns = /^(resume|cv|curriculum|summary|objective|experience|education|skills|contact|address|email|phone|profile)/i;
-          
-          for (const line of lines.slice(0, 5)) { // Check first 5 lines
-            const wordCount = line.split(/\s+/).length;
-            // Name heuristic: 1-4 words, no common headers, mostly letters
-            if (wordCount >= 1 && wordCount <= 4 && 
-                !skipPatterns.test(line) && 
-                /^[A-Za-z\s.\-']+$/.test(line) &&
-                line.length >= 3 && line.length <= 50) {
-              return `${line} [${chunk.sourceId}]`;
-            }
-          }
-        }
-        return null;
-      };
-
-      // If retrieval confidence is too low, avoid answering
-      const topScore = labeledSources[0]?.combinedScore ?? 0;
-      const wordCount = text.trim().split(/\s+/).filter(Boolean).length;
-      
-      // Lower threshold for identity queries - we have structural heuristics
-      const minScore = isIdentity ? 0.01 : (wordCount <= 3 ? 0.08 : 0.18);
-      
-      if (topScore < minScore) {
-        // Try identity extraction first for identity queries
-        if (isIdentity) {
-          const identityAnswer = extractIdentityInfo(labeledSources);
-          if (identityAnswer) {
-            self.postMessage({ type: 'retrieval_done', payload: { sources: labeledSources } });
-            self.postMessage({
-              type: 'query_result',
-              payload: { answer: identityAnswer, sources: labeledSources }
-            });
-            return;
-          }
-        }
-        
-        const extractive = buildExtractiveAnswer(labeledSources);
-        if (extractive) {
-          self.postMessage({
-            type: 'retrieval_done',
-            payload: { sources: labeledSources }
-          });
-          self.postMessage({
-            type: 'query_result',
-            payload: { answer: extractive, sources: labeledSources }
-          });
-          return;
-        }
-        self.postMessage({
-          type: 'query_result',
-          payload: {
-            answer: "I don't have that information in the provided documents.",
-            sources: labeledSources
-          }
-        });
-        return;
-      }
-      
-      // For identity queries with sufficient score, still try extraction first
-      if (isIdentity) {
-        const identityAnswer = extractIdentityInfo(labeledSources);
-        if (identityAnswer) {
-          self.postMessage({ type: 'retrieval_done', payload: { sources: labeledSources } });
-          self.postMessage({
-            type: 'query_result',
-            payload: { answer: identityAnswer, sources: labeledSources }
-          });
-          return;
-        }
-      }
-
-      // FAST RESPONSE: Send sources immediately
+      // Send sources immediately
       self.postMessage({
         type: 'retrieval_done',
         payload: { sources: labeledSources }
       });
 
-      // Inject structural context
+      // 4. Build context for LLM
       let context = labeledSources.map((c: any) => {
         const pageInfo = c.metadata?.page ? `[Page ${c.metadata.page}]` : '';
-        const orderInfo = c.metadata?.page === 1 && c.metadata?.chunkIndex === 0 ? '[Start of Document]' : '';
-        return `[${c.sourceId}] ${orderInfo} ${pageInfo}\n${c.text}`;
+        return `[${c.sourceId}] ${pageInfo}\n${c.text}`;
       }).join('\n\n---\n\n');
 
-      if (context.length > 2600) context = context.substring(0, 2600);
+      if (context.length > 3000) context = context.substring(0, 3000);
 
-      // 3. Prompting
+      // 5. Generate answer
       const prompt = `<|im_start|>system
-    You are a precise assistant. Use ONLY the context. If the answer is not explicitly in the context, reply: "I don't have that information in the provided documents." Do not guess or add facts. Keep answers concise. When you state a fact, include a citation in the form [S1], [S2], etc. Every factual sentence must end with a citation.
-    <|im_end|>
-    <|im_start|>user
-    Context:
-    ${context}
+You are a helpful assistant. Answer the question based on the context provided. Be concise and direct. If the answer is in the context, provide it. Cite sources using [S1], [S2] etc.
+<|im_end|>
+<|im_start|>user
+Context:
+${context}
 
-    Question: ${text}<|im_end|>
-    <|im_start|>assistant
-    `;
+Question: ${text}<|im_end|>
+<|im_start|>assistant
+`;
 
       console.log(`[Worker] Prompt length: ${prompt.length}`);
-      // validation logic removed as we use manual prompt
 
-      // 4. Generation with Streaming
+      // 6. Generation with Streaming
       try {
         const response = await gen(prompt, {
           max_new_tokens: 256,
@@ -538,54 +322,21 @@ self.addEventListener('message', async (e: MessageEvent) => {
           callback_function: (beams: any) => {
             try {
               const decoded = gen.tokenizer.decode(beams[0].output_ids, { skip_special_tokens: false });
-
               let partial = decoded;
               if (partial.startsWith(prompt)) {
                 partial = partial.substring(prompt.length);
               }
-              // Basic cleanup for the stream
               partial = partial.replace('<|im_end|>', '').replace('<|im_start|>', '');
-
-              self.postMessage({
-                type: 'stream_update',
-                payload: partial
-              });
+              self.postMessage({ type: 'stream_update', payload: partial });
             } catch (e) { }
           }
         });
 
         let answer = response[0]?.generated_text || '';
-        // Final Cleanup
         if (answer.startsWith(prompt)) {
           answer = answer.substring(prompt.length);
         }
         answer = answer.replace('<|im_end|>', '').trim();
-        answer = answer.replace(/^Answer:\s*/i, '');
-
-        if (answer.toLowerCase().includes("i don't have that information") && answer.length > 50) {
-          answer = "I don't have that information in the provided documents.";
-        }
-
-        // Ensure citations exist for factual answers; otherwise abstain
-        const hasCitation = /\[S\d+\]/.test(answer);
-        if (!hasCitation && !/i don't have that information/i.test(answer)) {
-          const normalized = answer.replace(/\s+/g, ' ').trim();
-          const shortAnswer = normalized.length > 0 && normalized.length <= 80;
-          if (shortAnswer) {
-            const matchIdx = labeledSources.findIndex((s: any) => s.text.includes(normalized));
-            if (matchIdx >= 0) {
-              answer = `${normalized} [S${matchIdx + 1}]`;
-            } else {
-              const extractive = buildExtractiveAnswer(labeledSources);
-              answer = extractive || "I don't have that information in the provided documents.";
-            }
-          } else {
-            const extractive = buildExtractiveAnswer(labeledSources);
-            answer = extractive || "I don't have that information in the provided documents.";
-          }
-        }
-
-        console.log('Qwen Answer:', answer);
 
         if (!answer) answer = "Could not generate answer.";
 
