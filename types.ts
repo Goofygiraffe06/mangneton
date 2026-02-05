@@ -51,6 +51,6 @@ export interface InitProgressPayload {
 }
 
 export interface WorkerResponse {
-  type: 'init_done' | 'init_progress' | 'ingest_progress' | 'ingest_done' | 'query_result' | 'error';
+  type: 'init_done' | 'init_progress' | 'ingest_progress' | 'ingest_done' | 'query_result' | 'retrieval_done' | 'stream_update' | 'error';
   payload?: any;
 }

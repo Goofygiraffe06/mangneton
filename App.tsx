@@ -48,16 +48,66 @@ export default function App() {
             setIsProcessing(false);
             setProcessingProgress(0);
             refreshDocs();
-            // Add success message
             setMessages(prev => [...prev, {
               id: uuidv4(),
               role: 'system',
-              content: '✅ Document processed successfully! You can now ask questions about it.',
+              content: 'Document processed successfully. You can now ask questions.',
               timestamp: Date.now()
             }]);
             break;
+          case 'retrieval_done':
+            // Show sources immediately while thinking
+            setMessages(prev => {
+              const lastMsg = prev[prev.length - 1];
+              // If we already have a placeholder assistant message (from initial send? no we usually don't)
+              // Actually we usually just have user message. We need to create the assistant placeholder here.
+
+              return [...prev, {
+                id: uuidv4(),
+                role: 'assistant',
+                content: '', // Empty content for now, will stream in
+                sources: payload.sources,
+                timestamp: Date.now()
+              }];
+            });
+            break;
+          case 'stream_update':
+            // Handle streaming text
+            setMessages(prev => {
+              const lastMsg = prev[prev.length - 1];
+              if (lastMsg && lastMsg.role === 'assistant') {
+                return prev.map(msg => msg.id === lastMsg.id ? { ...msg, content: payload } : msg);
+              } else {
+                // Fallback if retrieval_done didn't fire for some reason (unlikely)
+                return [...prev, {
+                  id: uuidv4(),
+                  role: 'assistant',
+                  content: payload,
+                  timestamp: Date.now()
+                }];
+              }
+            });
+            break;
           case 'query_result':
-            addBotMessage(payload.answer, payload.sources);
+            // Final update, just ensure consistency
+            setMessages(prev => {
+              const lastMsg = prev[prev.length - 1];
+              if (lastMsg && lastMsg.role === 'assistant') {
+                return prev.map(msg => msg.id === lastMsg.id ? {
+                  ...msg,
+                  content: payload.answer,
+                  sources: payload.sources
+                } : msg);
+              }
+              // This fallback should rarely happen now
+              return [...prev, {
+                id: uuidv4(),
+                role: 'assistant',
+                content: payload.answer,
+                sources: payload.sources,
+                timestamp: Date.now()
+              }];
+            });
             break;
           case 'error':
             console.error("Worker Error:", payload);
@@ -159,7 +209,7 @@ export default function App() {
       setMessages(prev => [...prev, {
         id: uuidv4(),
         role: 'system',
-        content: `❌ Error: ${err?.message || 'Failed to process files'}`,
+        content: `Error: ${err?.message || 'Failed to process files'}`,
         timestamp: Date.now()
       }]);
     }
@@ -207,7 +257,7 @@ export default function App() {
         />
       )}
 
-      <div className="flex h-screen bg-gray-50 overflow-hidden">
+      <div className="flex h-screen bg-zinc-50 overflow-hidden">
         <Sidebar
           documents={documents}
           onUpload={handleUpload}
@@ -215,7 +265,7 @@ export default function App() {
           isProcessing={isProcessing}
           processingProgress={processingProgress}
         />
-        <main className="flex-1 flex flex-col h-full">
+        <main className="flex-1 flex flex-col h-full relative">
           <ChatInterface
             messages={messages}
             onSendMessage={handleSendMessage}
